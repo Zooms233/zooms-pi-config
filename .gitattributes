@@ -1,0 +1,22 @@
+# 统一换行，避免 Windows CRLF 导致跨平台 diff 全红
+* text=auto eol=lf
+
+# 需要 CRLF 的脚本
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 二进制，禁止换行转换与 diff
+*.exe   binary
+*.dll   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+
+# 语言标注，GitHub 会更准确
+*.ts    linguist-language=TypeScript
