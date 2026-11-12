@@ -1,36 +1,22 @@
 /**
  * yankcode.ts — 复制 assistant 回答里的 Markdown 代码块原文
  *
- * 解决 fullscreen 模式下鼠标拖选把「软换行」变成硬换行的问题：
- * 这里读取 session 里的原始 Markdown（未经渲染），因此复制出的内容与源文本逐字符一致。
- *
- * 用法：
- *   /yc            最近一条含代码块的 assistant 消息里有 1 块 → 直接复制；多块 → 弹选择列表
- *   /yc 2          直接复制第 2 块
- *   /yankcode      同上（别名）
- *
- * 规则：
- * - 只认 fenced code block（``` 或 ~~~，长度 ≥3，最多 3 空格缩进）
- * - 闭合 fence 需同字符、长度 ≥ 开启长度、其后无 info string
- * - 只复制 fence 之间的内容，不含语言标注和 fence 本身
- * - 未闭合的块（流式截断等）直接丢弃
- * - 不支持 4 空格缩进的代码块
- * - 流式输出期间不复制
+ * 读 session 里的原始 Markdown，避开 fullscreen 拖选把软换行变硬换行的问题。
+ *   /yc [序号]  /yankcode
+ * 只认 fenced block（```/~~~，≤3 空格缩进，闭合需同字符且不短于开启）；
+ * 未闭合块、4 空格缩进块不支持。
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 
 interface CodeBlock {
-	/** 1-based 序号，用于 /yc N */
-	index: number;
-	/** 语言标注（info string 的首个 token），空串表示未标注 */
-	lang: string;
-	/** fence 之间的原文 */
+	index: number; // 1-based，用于 /yc N
+	lang: string; // info string 首个 token，空串=未标注
 	code: string;
 	lineCount: number;
-	/** 首个非空行摘要，用于选择列表 */
-	preview: string;
+	preview: string; // 首个非空行，选择列表用
 }
 
 interface OpenFence {
@@ -56,7 +42,7 @@ function buildBlock(index: number, open: OpenFence): CodeBlock {
 		lang: open.lang,
 		code: open.content.join("\n"),
 		lineCount: open.content.length,
-		preview: previewLine.trim().slice(0, 40),
+		preview: truncateToWidth(previewLine.trim(), 40, "…"),
 	};
 }
 
@@ -99,7 +85,7 @@ function extractCodeBlocks(markdown: string): CodeBlock[] {
 	return blocks;
 }
 
-function getLastAssistantMarkdown(ctx: ExtensionCommandContext): string | undefined {
+function getLastAssistantBlocks(ctx: ExtensionCommandContext): CodeBlock[] | undefined {
 	const branch = ctx.sessionManager.getBranch();
 	for (let i = branch.length - 1; i >= 0; i--) {
 		const entry = branch[i];
@@ -111,7 +97,8 @@ function getLastAssistantMarkdown(ctx: ExtensionCommandContext): string | undefi
 		for (const part of message.content) {
 			if (part.type === "text") text += part.text;
 		}
-		if (extractCodeBlocks(text).length > 0) return text;
+		const blocks = extractCodeBlocks(text);
+		if (blocks.length > 0) return blocks;
 	}
 	return undefined;
 }
@@ -129,13 +116,12 @@ export default function yankCodeExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		const markdown = getLastAssistantMarkdown(ctx);
-		if (markdown === undefined) {
+		const blocks = getLastAssistantBlocks(ctx);
+		if (blocks === undefined) {
 			ctx.ui.notify("没有找到代码块", "warning");
 			return;
 		}
 
-		const blocks = extractCodeBlocks(markdown);
 		const arg = args.trim();
 		let target: CodeBlock | undefined;
 

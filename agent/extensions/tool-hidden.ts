@@ -1,159 +1,96 @@
 /**
- * tool-hidden.ts — 给 pi 的 tool 块增加第三种显示状态，`ctrl+o` 三态轮转：
+ * tool-hidden.ts — `ctrl+o` 三态轮转：collapsed → hidden → expanded → collapsed
  *
- *   collapsed → hidden → expanded → collapsed → ...
- * 默认 collapsed，每次按下都按上述顺序流转。
+ *   collapsed / expanded：沿用内置渲染
+ *   hidden              ：丢弃输出，只留一行斜体 `toolName...`
+ *                         （块外壳的空行与背景由 pi 绘制，无法省掉）
  *
- *   collapsed / expanded：完全沿用内置渲染（截断 / 完整输出）
- *   hidden              ：只显示一行斜体 `toolName...`
+ * 渲染用 pi.registerToolRenderer()，只包 renderCall/renderResult，不改 tool 定义，
+ * 故内置工具、MCP 工具、子 agent 工具一并生效。
+ * 快捷键不用 registerShortcut（与内置 app.tree.filter.cycleForward 同键，会报冲突诊断），
+ * 改用 setEditorComponent 替换编辑器，编辑器只在聚焦时收输入，/tree 下不冲突。
  *
- * 状态保存位置：
- *   pi 的扩展加载器是 moduleCache:false（loader.ts），/reload 会重新执行模块，
- *   模块级变量会重置。因此显示状态放在进程级 globalThis（Symbol.for 命名）：
- *     - /new、/resume、/reload：同一进程，继承上一次状态
- *     - 退出后重启 pi：进程重建，回到默认 collapsed
- *
- * 接管方式（替换编辑器组件，不用 registerShortcut）：
- *   注册 ctrl+o 快捷键会与内置 app.tree.filter.cycleForward 同键，触发 pi 的
- *   快捷键冲突诊断（[Extension issues]，无设置可隐藏）。改为用
- *   ctx.ui.setEditorComponent() 把默认编辑器换成 CustomEditor 子类，在
- *   handleInput 里先拦 ctrl+o；编辑器只在聚焦时收到输入，/tree 打开时焦点在
- *   TreeSelectorComponent，故不冲突、也无诊断。
- *
- * 鼠标点击工具块仍可用：组件内部 expanded 变化会被检测到并同步为 collapsed/expanded。
+ * 状态放 globalThis（Symbol.for）：/reload 会重执行模块，模块级变量会丢；
+ * 进程内 /new、/resume、/reload 继承，重启回到 collapsed。
  */
 
-import {
-	CustomEditor,
-	SettingsManager,
-	createBashToolDefinition,
-	createEditToolDefinition,
-	createFindToolDefinition,
-	createGrepToolDefinition,
-	createLsToolDefinition,
-	createPowerShellToolDefinition,
-	createReadToolDefinition,
-	createWriteToolDefinition,
-	type ExtensionAPI,
-	type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+import { CustomEditor, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Key, Text, matchesKey } from "@earendil-works/pi-tui";
 
 type Mode = "collapsed" | "expanded" | "hidden";
 
-interface ViewState {
-	mode: Mode;
-}
-
 // 进程级状态：跨 /new、/resume、/reload 继承，进程重启后重新初始化
 const STATE_KEY = Symbol.for("pi-ext.tool-view.state");
-const globalStore = globalThis as unknown as Record<symbol, ViewState>;
-const state: ViewState = (globalStore[STATE_KEY] ??= { mode: "collapsed" });
+const globalStore = globalThis as unknown as Record<symbol, { mode: Mode }>;
+const state = (globalStore[STATE_KEY] ??= { mode: "collapsed" });
 
-/** toolCallId -> 该 tool 组件的局部重绘函数 */
-const invalidators = new Map<string, () => void>();
-/** toolCallId -> 上一次观察到的“组件内部 expanded”，用于识别鼠标点击 */
-const seenExpanded = new Map<string, boolean>();
+/**
+ * toolCallId -> 弱引用该组件长期持有的 rendererState（context.state）。
+ * 不能直接弱引用 context.invalidate：它是 getRenderContext() 每次新建的闭包，
+ * 组件不持有它，GC 后 deref 即为 undefined。state 由 ToolExecutionComponent
+ * 强持有（this.rendererState），组件移除后随之可回收，键也会在下次 cycle 清掉。
+ */
+const invalidators = new Map<string, WeakRef<{ invalidate?: () => void }>>();
+
 /** 最近一次 session 的 UI 上下文，用于底部状态消息 */
 let uiCtx: { notify(message: string, type?: "info" | "warning" | "error"): void } | undefined;
 
-function refreshAll(): void {
-	for (const invalidate of invalidators.values()) {
+const NEXT: Record<Mode, Mode> = { collapsed: "hidden", hidden: "expanded", expanded: "collapsed" };
+
+function cycle(): void {
+	state.mode = NEXT[state.mode];
+	for (const [toolCallId, ref] of invalidators) {
+		const rendererState = ref.deref();
+		if (!rendererState) {
+			invalidators.delete(toolCallId);
+			continue;
+		}
 		try {
-			invalidate();
+			rendererState.invalidate?.();
 		} catch {
 			// 组件可能已被移除
 		}
 	}
+	// notify -> showStatus，即内置 ctrl+o 原来那种底部 dim 提示
+	uiCtx?.notify(`Tool blocks: ${state.mode}`, "info");
 }
 
-/** 渲染过程中不要同步重绘其它组件，推迟到当前渲染结束后 */
-function deferRefreshAll(): void {
-	queueMicrotask(refreshAll);
-}
+/**
+ * 只替换渲染器：展开状态由全局 mode 决定，覆盖组件自身的 expanded。
+ * 只包 base 已有的渲染器，没有的留给 pi 自己的 fallback（会格式化参数）。
+ * 必须 spread base，否则丢掉 name/label/execute/renderShell 等定义字段。
+ */
+function decorate(base: ToolDefinition, fallbackName: string): ToolDefinition {
+	const name = base.label || fallbackName;
+	const { renderCall, renderResult } = base;
+	const out: ToolDefinition = { ...base };
 
-/** 组件内部 expanded 被外部改变（鼠标点击）时，把全局 mode 同步过去 */
-function syncInternalExpanded(toolCallId: string, internalExpanded: boolean): void {
-	const prev = seenExpanded.get(toolCallId);
-	seenExpanded.set(toolCallId, internalExpanded);
-	if (prev === undefined || prev === internalExpanded) return;
-	state.mode = internalExpanded ? "expanded" : "collapsed";
-	deferRefreshAll();
-}
+	/** 记住该组件的重绘句柄（见 invalidators 注释） */
+	const track = (context: any) => {
+		context.state.invalidate = context.invalidate;
+		invalidators.set(context.toolCallId, new WeakRef(context.state));
+	};
 
-function wrapDefinition(definition: ToolDefinition): ToolDefinition {
-	const baseCall = definition.renderCall;
-	const baseResult = definition.renderResult;
-	const name = definition.label || definition.name;
-
-	return {
-		...definition,
-
-		renderCall(args: any, theme: any, context: any) {
-			invalidators.set(context.toolCallId, context.invalidate);
-			syncInternalExpanded(context.toolCallId, context.expanded);
-
+	if (renderCall) {
+		out.renderCall = (args, theme, context) => {
+			track(context);
 			if (state.mode === "hidden") {
 				return new Text(theme.italic(theme.fg("muted", `${name}...`)), 0, 0);
 			}
-			const expanded = state.mode === "expanded";
-			return baseCall
-				? baseCall(args, theme, { ...context, expanded })
-				: new Text(theme.fg("toolTitle", theme.bold(definition.name)), 0, 0);
-		},
-
-		renderResult(result: any, options: any, theme: any, context: any) {
-			invalidators.set(context.toolCallId, context.invalidate);
-			syncInternalExpanded(context.toolCallId, context.expanded);
-
-			if (state.mode === "hidden") {
-				// 只保留 renderCall 那一行 `name...`
-				return new Text("", 0, 0);
-			}
-			const expanded = state.mode === "expanded";
-			return baseResult
-				? baseResult(result, { ...options, expanded }, theme, { ...context, expanded })
-				: new Text("", 0, 0);
-		},
-	};
-}
-
-function buildDefinitions(cwd: string): ToolDefinition[] {
-	let shellPath: string | undefined;
-	let commandPrefix: string | undefined;
-	let autoResizeImages = true;
-	try {
-		const settings = SettingsManager.create(cwd);
-		shellPath = settings.getShellPath();
-		commandPrefix = settings.getShellCommandPrefix();
-		autoResizeImages = settings.getImageAutoResize();
-	} catch {
-		// 读设置失败就退回内置默认值
+			return renderCall(args, theme, { ...context, expanded: state.mode === "expanded" });
+		};
 	}
 
-	return [
-		createReadToolDefinition(cwd, { autoResizeImages }),
-		createBashToolDefinition(cwd, { shellPath, commandPrefix }),
-		createPowerShellToolDefinition(cwd),
-		createEditToolDefinition(cwd),
-		createWriteToolDefinition(cwd),
-		createGrepToolDefinition(cwd),
-		createFindToolDefinition(cwd),
-		createLsToolDefinition(cwd),
-	] as unknown as ToolDefinition[];
-}
+	if (renderResult) {
+		out.renderResult = (result, options, theme, context) => {
+			track(context);
+			if (state.mode === "hidden") return new Text("", 0, 0);
+			const expanded = state.mode === "expanded";
+			return renderResult(result, { ...options, expanded }, theme, { ...context, expanded });
+		};
+	}
 
-function nextMode(): Mode {
-	if (state.mode === "expanded") return "collapsed";
-	if (state.mode === "collapsed") return "hidden";
-	return "expanded";
-}
-
-function cycle(): void {
-	state.mode = nextMode();
-	refreshAll();
-	// notify -> showStatus，即内置 ctrl+o 原来那种底部 dim 提示
-	uiCtx?.notify(`Tool blocks: ${state.mode}`, "info");
+	return out;
 }
 
 /** 只在编辑器聚焦时收到输入，因此 /tree 等场景不会触发本逻辑 */
@@ -168,19 +105,19 @@ class ToolViewEditor extends CustomEditor {
 }
 
 export default function (pi: ExtensionAPI) {
-	for (const definition of buildDefinitions(process.cwd())) {
-		pi.registerTool(wrapDefinition(definition));
-	}
+	pi.registerToolRenderer((toolName, next) => {
+		const base = next();
+		return base && decorate(base, toolName);
+	});
 
 	pi.registerCommand("tool-view", {
 		description: "Cycle tool block view: collapsed / expanded / hidden",
-		handler: (_args, _ctx) => cycle(),
+		handler: () => cycle(),
 	});
 
 	pi.on("session_start", (_event, ctx) => {
 		// 只清理与旧组件绑定的重绘句柄；显示状态保留（/new、/resume、/reload 继承）
 		invalidators.clear();
-		seenExpanded.clear();
 		uiCtx = ctx.ui;
 
 		if (ctx.mode !== "tui") return;
@@ -194,6 +131,5 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => {
 		invalidators.clear();
-		seenExpanded.clear();
 	});
 }

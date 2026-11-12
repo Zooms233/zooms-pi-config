@@ -1,9 +1,4 @@
-/**
- * Bash/PowerShell Default Timeout
- *
- * Fills in a default timeout (seconds) when the model omits one.
- * Explicit values from the model are left untouched.
- */
+/** bash/powershell 未传 timeout（内置无超时）时补默认值，显式传入不覆盖 */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
